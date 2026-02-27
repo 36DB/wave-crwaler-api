@@ -2,8 +2,10 @@ import re
 import requests
 from flask import Flask, request, jsonify
 from bs4 import BeautifulSoup
+from flask_cors import CORS
 
 app = Flask(__name__)
+CORS(app)
 
 session = requests.Session()
 session.headers.update({
