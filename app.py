@@ -1,8 +1,24 @@
+import os
 import re
+from datetime import datetime, timezone
+
 import requests
-from flask import Flask, request, jsonify
 from bs4 import BeautifulSoup
+from flask import Flask, request, jsonify
 from flask_cors import CORS
+from supabase import create_client
+
+# =============================
+# 기본 설정
+# =============================
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+
+if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+    raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
+
+supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 app = Flask(__name__)
 CORS(app)
@@ -15,24 +31,37 @@ session.headers.update({
 })
 
 
-# -----------------------------
-# URL 변환 (모바일 → PC)
-# -----------------------------
+# =============================
+# 유틸
+# =============================
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
 def normalize_url(url: str):
+    """
+    모바일 디시 링크를 PC 링크로 변환
+    """
     try:
         if "m.dcinside.com/board/" in url:
             m = re.search(r"/board/([^/]+)/(\d+)", url)
             if m:
                 return f"https://gall.dcinside.com/mgallery/board/view/?id={m.group(1)}&no={m.group(2)}"
-    except:
+    except Exception:
         pass
     return url
 
 
-# -----------------------------
-# 웨이브 번호 추출
-# -----------------------------
 def extract_wave(text):
+    """
+    웨이브 번호 추출
+    허용 예:
+    - 웨이브 2
+    - 2웨이브
+    - Wave 2
+    - 2 Wave
+    """
     patterns = [
         r"(?:웨이브|[Ww]ave)\s*(\d+)",
         r"(\d+)\s*(?:웨이브|[Ww]ave)"
@@ -44,10 +73,10 @@ def extract_wave(text):
     return ""
 
 
-# -----------------------------
-# 흐름도 추출
-# -----------------------------
 def extract_flow(text):
+    """
+    본문에서 흐름도 추출
+    """
     lines = [l.strip() for l in text.splitlines() if l.strip()]
 
     chain_lines = []
@@ -66,14 +95,16 @@ def extract_flow(text):
     chain = " ".join(chain_lines)
     chain = re.sub(r"\s*>\s*", " -> ", chain)
     chain = re.sub(r"\s*->\s*", " -> ", chain)
+    chain = re.sub(r"\s*-\s*->\s*", " -> ", chain)
+    chain = re.sub(r"\s+", " ", chain)
 
     return chain.strip()
 
 
-# -----------------------------
-# 글 크롤링
-# -----------------------------
 def crawl_post(url):
+    """
+    글 크롤링
+    """
     url = normalize_url(url)
 
     r = session.get(url, timeout=10)
@@ -96,22 +127,236 @@ def crawl_post(url):
     }
 
 
-# -----------------------------
+# =============================
+# DB 헬퍼
+# =============================
+
+def get_active_run(wave_name: str):
+    """
+    특정 웨이브 이름의 현재 active run 하나 가져오기
+    """
+    result = (
+        supabase.table("event_runs")
+        .select("*")
+        .eq("wave_name", wave_name)
+        .eq("status", "active")
+        .order("started_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+
+    if result.data and len(result.data) > 0:
+        return result.data[0]
+    return None
+
+
+def close_all_active_runs(wave_name: str):
+    """
+    같은 웨이브 이름의 active run 전부 종료
+    """
+    result = (
+        supabase.table("event_runs")
+        .select("*")
+        .eq("wave_name", wave_name)
+        .eq("status", "active")
+        .execute()
+    )
+
+    if not result.data:
+        return
+
+    for row in result.data:
+        (
+            supabase.table("event_runs")
+            .update({
+                "status": "closed",
+                "ended_at": now_iso()
+            })
+            .eq("id", row["id"])
+            .execute()
+        )
+
+
+# =============================
 # API
-# -----------------------------
-@app.route("/crawl")
+# =============================
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"ok": True, "message": "alive"})
+
+
+@app.route("/crawl", methods=["GET"])
 def crawl():
     url = request.args.get("url")
     if not url:
-        return jsonify({"error": "no url"})
+        return jsonify({"error": "no url"}), 400
 
     try:
         result = crawl_post(url)
         return jsonify(result)
     except Exception as e:
-        return jsonify({"error": str(e)})
+        return jsonify({"error": str(e)}), 500
 
 
-# Render용
+@app.route("/run/start", methods=["POST"])
+def run_start():
+    """
+    새 이벤트 시작
+    - 같은 wave_name의 기존 active run이 있으면 종료
+    - 새 active run 생성
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        wave_name = data.get("waveName")
+
+        if not wave_name:
+            return jsonify({"error": "waveName is required"}), 400
+
+        close_all_active_runs(wave_name)
+
+        created = (
+            supabase.table("event_runs")
+            .insert({
+                "wave_name": wave_name,
+                "status": "active"
+            })
+            .execute()
+        )
+
+        return jsonify({
+            "ok": True,
+            "message": "new run started",
+            "data": created.data
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/run/close", methods=["POST"])
+def run_close():
+    """
+    현재 이벤트 종료
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        wave_name = data.get("waveName")
+
+        if not wave_name:
+            return jsonify({"error": "waveName is required"}), 400
+
+        active_run = get_active_run(wave_name)
+        if not active_run:
+            return jsonify({"error": "no active run"}), 404
+
+        updated = (
+            supabase.table("event_runs")
+            .update({
+                "status": "closed",
+                "ended_at": now_iso()
+            })
+            .eq("id", active_run["id"])
+            .execute()
+        )
+
+        return jsonify({
+            "ok": True,
+            "message": "run closed",
+            "data": updated.data
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/state/save", methods=["POST"])
+def state_save():
+    """
+    현재 상태 저장
+    body:
+    {
+      "waveName": "[기습웨이브]",
+      "waveNumber": 2,
+      "flowText": "A -> B -> C ->",
+      "lastPostUrl": "https://..."
+    }
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+
+        wave_name = data.get("waveName")
+        wave_number = data.get("waveNumber")
+        flow_text = data.get("flowText")
+        last_post_url = data.get("lastPostUrl", "")
+
+        if not wave_name or wave_number is None or not flow_text:
+            return jsonify({
+                "error": "waveName, waveNumber, flowText are required"
+            }), 400
+
+        active_run = get_active_run(wave_name)
+        if not active_run:
+            return jsonify({
+                "error": "no active run. start a run first"
+            }), 404
+
+        saved = (
+            supabase.table("wave_states")
+            .insert({
+                "run_id": active_run["id"],
+                "wave_number": int(wave_number),
+                "flow_text": flow_text,
+                "last_post_url": last_post_url
+            })
+            .execute()
+        )
+
+        return jsonify({
+            "ok": True,
+            "message": "state saved",
+            "data": saved.data
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/state/latest", methods=["GET"])
+def state_latest():
+    """
+    현재 active run의 최신 상태 가져오기
+    query:
+    ?waveName=[기습웨이브]
+    """
+    try:
+        wave_name = request.args.get("waveName")
+
+        if not wave_name:
+            return jsonify({"error": "waveName is required"}), 400
+
+        active_run = get_active_run(wave_name)
+        if not active_run:
+            return jsonify({"error": "no active run"}), 404
+
+        latest = (
+            supabase.table("wave_states")
+            .select("*")
+            .eq("run_id", active_run["id"])
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+
+        if not latest.data:
+            return jsonify({"error": "no saved state"}), 404
+
+        return jsonify({
+            "ok": True,
+            "run": active_run,
+            "state": latest.data[0]
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# 로컬 실행용
 if __name__ == "__main__":
     app.run()
