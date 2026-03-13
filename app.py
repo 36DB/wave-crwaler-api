@@ -132,6 +132,40 @@ def extract_writer_id_from_post_url(url: str):
 
         soup = BeautifulSoup(r.text, "html.parser")
 
+        # 1) 게시글 페이지의 작성자 영역 찾기
+        writer_el = (
+            soup.select_one(".gall_writer")
+            or soup.select_one("span.ub-writer")
+            or soup.select_one("span.gall_writer")
+            or soup.select_one("div.gall_writer")
+        )
+
+        # 2) 작성자 영역 자체의 data-* 속성
+        if writer_el:
+            writer_id = (
+                (writer_el.get("data-uid") or "").strip()
+                or (writer_el.get("data-userid") or "").strip()
+                or (writer_el.get("data-nickid") or "").strip()
+            )
+            if writer_id:
+                return writer_id
+
+            # 3) 작성자 영역 내부 자식 요소의 data-* 속성
+            child = (
+                writer_el.find(attrs={"data-uid": True})
+                or writer_el.find(attrs={"data-userid": True})
+                or writer_el.find(attrs={"data-nickid": True})
+            )
+            if child:
+                writer_id = (
+                    (child.get("data-uid") or "").strip()
+                    or (child.get("data-userid") or "").strip()
+                    or (child.get("data-nickid") or "").strip()
+                )
+                if writer_id:
+                    return writer_id
+
+        # 4) gallog 링크 href에서 찾기
         gallog_link = soup.find("a", href=re.compile(r"gallog\.dcinside\.com"))
         if gallog_link:
             href = gallog_link.get("href", "")
@@ -139,6 +173,7 @@ def extract_writer_id_from_post_url(url: str):
             if m:
                 return m.group(1).strip()
 
+        # 5) onclick fallback
         gallog_link = soup.find("a", onclick=re.compile(r"gallog\.dcinside\.com"))
         if gallog_link:
             raw = gallog_link.get("onclick", "")
@@ -146,7 +181,8 @@ def extract_writer_id_from_post_url(url: str):
             if m:
                 return m.group(1).strip()
 
-    except Exception:
+    except Exception as e:
+        print("[WARN] extract_writer_id_from_post_url failed:", url, str(e))
         return None
 
     return None
