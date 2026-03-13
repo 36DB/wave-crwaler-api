@@ -79,9 +79,15 @@ def extract_flow(text):
         return ""
 
     chain = " ".join(chain_lines)
-    chain = re.sub(r"\s*>\s*", " -> ", chain)
-    chain = re.sub(r"\s*->\s*", " -> ", chain)
+
+    # 이미 깨진 A - -> B 복원
     chain = re.sub(r"\s*-\s*->\s*", " -> ", chain)
+
+    # 단독 > 만 -> 로 변환 (기존 -> 는 유지)
+    chain = re.sub(r"(?<!-)\s*>\s*", " -> ", chain)
+
+    # 화살표 주변 공백 통일
+    chain = re.sub(r"\s*->\s*", " -> ", chain)
     chain = re.sub(r"\s+", " ", chain)
 
     return chain.strip()
