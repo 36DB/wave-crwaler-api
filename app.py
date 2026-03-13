@@ -154,27 +154,10 @@ def close_all_active_runs(wave_name: str):
         )
 
 
-def get_latest_state_for_wave(run_id: int, wave_number: int):
-    result = (
-        supabase.table("wave_states")
-        .select("*")
-        .eq("run_id", run_id)
-        .eq("wave_number", wave_number)
-        .order("created_at", desc=True)
-        .limit(1)
-        .execute()
-    )
-
-    if result.data and len(result.data) > 0:
-        return result.data[0]
-    return None
-
-
 def get_current_states_for_run(run_id: int):
     """
-    병렬 웨이브용:
-    run 안의 모든 상태를 최신순으로 가져와서
-    wave_number별 최신 1개만 반환
+    run 안의 전체 상태를 created_at desc로 가져온 뒤
+    wave_number별 최신 1개만 남김
     """
     result = (
         supabase.table("wave_states")
@@ -332,40 +315,6 @@ def state_save():
             "ok": True,
             "message": "state saved",
             "data": saved.data
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/state/latest", methods=["GET"])
-def state_latest():
-    """
-    현재 active run 안에서 특정 wave_number의 최신 상태 가져오기
-    query:
-    ?waveName=[금토일웨이브]&waveNumber=2
-    """
-    try:
-        wave_name = request.args.get("waveName")
-        wave_number = request.args.get("waveNumber")
-
-        if not wave_name:
-            return jsonify({"error": "waveName is required"}), 400
-
-        if not wave_number:
-            return jsonify({"error": "waveNumber is required"}), 400
-
-        active_run = get_active_run(wave_name)
-        if not active_run:
-            return jsonify({"error": "no active run"}), 404
-
-        latest = get_latest_state_for_wave(active_run["id"], int(wave_number))
-        if not latest:
-            return jsonify({"error": "no saved state for this wave"}), 404
-
-        return jsonify({
-            "ok": True,
-            "run": active_run,
-            "state": latest
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
