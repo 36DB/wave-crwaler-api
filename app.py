@@ -39,6 +39,12 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
+def canon_name(s: str):
+    s = s.strip()
+    s = re.sub(r"\s+", "", s)
+    return s
+
+
 def normalize_url(url: str):
     try:
         if "m.dcinside.com/board/" in url:
@@ -83,7 +89,7 @@ def extract_flow(text):
     # 이미 깨진 A - -> B 복원
     chain = re.sub(r"\s*-\s*->\s*", " -> ", chain)
 
-    # 단독 > 만 -> 로 변환 (기존 -> 는 유지)
+    # 단독 > 만 -> 로 변환
     chain = re.sub(r"(?<!-)\s*>\s*", " -> ", chain)
 
     # 화살표 주변 공백 통일
@@ -91,6 +97,59 @@ def extract_flow(text):
     chain = re.sub(r"\s+", " ", chain)
 
     return chain.strip()
+
+
+def parse_flow_text(flow_text: str):
+    if not flow_text:
+        return []
+
+    chain = flow_text.replace("\u00a0", " ")
+    chain = re.sub(r"\s*-\s*->\s*", " -> ", chain)
+    chain = re.sub(r"(?<!-)\s*>\s*", " -> ", chain)
+    chain = re.sub(r"\s*->\s*", " -> ", chain)
+
+    parts = [seg.strip() for seg in chain.split("->")]
+    parts = [p for p in parts if p]
+
+    cleaned = []
+    for p in parts:
+        p = re.sub(r"^\-+\s*", "", p)
+        p = re.sub(r"\s*\-+$", "", p)
+        if p:
+            cleaned.append(p)
+
+    return cleaned
+
+
+def extract_writer_id_from_post_url(url: str):
+    if not url:
+        return None
+
+    try:
+        normalized = normalize_url(url)
+        r = session.get(normalized, timeout=10)
+        r.raise_for_status()
+
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        gallog_link = soup.find("a", href=re.compile(r"gallog\.dcinside\.com"))
+        if gallog_link:
+            href = gallog_link.get("href", "")
+            m = re.search(r"gallog\.dcinside\.com/?([A-Za-z0-9_]+)", href)
+            if m:
+                return m.group(1).strip()
+
+        gallog_link = soup.find("a", onclick=re.compile(r"gallog\.dcinside\.com"))
+        if gallog_link:
+            raw = gallog_link.get("onclick", "")
+            m = re.search(r"gallog\.dcinside\.com/?([A-Za-z0-9_]+)", raw)
+            if m:
+                return m.group(1).strip()
+
+    except Exception:
+        return None
+
+    return None
 
 
 def crawl_post(url):
@@ -161,10 +220,6 @@ def close_all_active_runs(wave_name: str):
 
 
 def get_current_states_for_run(run_id: int):
-    """
-    run 안의 전체 상태를 created_at desc로 가져온 뒤
-    wave_number별 최신 1개만 남김
-    """
     result = (
         supabase.table("wave_states")
         .select("*")
@@ -183,6 +238,66 @@ def get_current_states_for_run(run_id: int):
             by_wave[wave_number] = row
 
     return sorted(by_wave.values(), key=lambda x: x["wave_number"])
+
+
+def build_board_summaries(states):
+    waves = {}
+    for row in states:
+        row["participants_list"] = parse_flow_text(row.get("flow_text", ""))
+        wave_num = row["wave_number"]
+        waves.setdefault(wave_num, []).append(row)
+
+    summaries = []
+
+    for wave_num, recs in waves.items():
+        valid_recs = [r for r in recs if r["participants_list"]]
+        if not valid_recs:
+            continue
+
+        main_rec = max(
+            valid_recs,
+            key=lambda r: (len(r["participants_list"]), r.get("created_at", ""))
+        )
+
+        final_chain = main_rec["participants_list"]
+        final_canon = [canon_name(p) for p in final_chain]
+        final_pos = {c: i for i, c in enumerate(final_canon)}
+
+        post_info_by_canon = {}
+
+        for rec in valid_recs:
+            plist = rec["participants_list"]
+            if len(plist) < 2:
+                continue
+
+            source_raw = plist[-2]
+            source_c = canon_name(source_raw)
+
+            if source_c not in final_pos:
+                continue
+
+            cand = {
+                "url": rec.get("last_post_url"),
+                "writer_id": rec.get("last_post_writer_id"),
+                "score_len": len(plist),
+                "score_time": rec.get("created_at", "")
+            }
+
+            prev = post_info_by_canon.get(source_c)
+            if not prev:
+                post_info_by_canon[source_c] = cand
+            else:
+                if (cand["score_len"], cand["score_time"]) > (prev["score_len"], prev["score_time"]):
+                    post_info_by_canon[source_c] = cand
+
+        summaries.append({
+            "wave": wave_num,
+            "final_chain": final_chain,
+            "post_info_by_canon": post_info_by_canon
+        })
+
+    summaries.sort(key=lambda x: x["wave"])
+    return summaries
 
 
 # =============================
@@ -209,10 +324,6 @@ def crawl():
 
 @app.route("/run/start", methods=["POST"])
 def run_start():
-    """
-    새 이벤트 시작
-    같은 wave_name의 기존 active run이 있으면 종료 후 새로 시작
-    """
     try:
         data = request.get_json(silent=True) or {}
         wave_name = data.get("waveName")
@@ -242,9 +353,6 @@ def run_start():
 
 @app.route("/run/close", methods=["POST"])
 def run_close():
-    """
-    현재 이벤트 종료
-    """
     try:
         data = request.get_json(silent=True) or {}
         wave_name = data.get("waveName")
@@ -277,16 +385,6 @@ def run_close():
 
 @app.route("/state/save", methods=["POST"])
 def state_save():
-    """
-    현재 상태 저장
-    body:
-    {
-      "waveName": "[금토일웨이브]",
-      "waveNumber": 2,
-      "flowText": "A -> B -> C ->",
-      "lastPostUrl": "https://..."
-    }
-    """
     try:
         data = request.get_json(silent=True) or {}
 
@@ -306,13 +404,18 @@ def state_save():
                 "error": "no active run. start a run first"
             }), 404
 
+        last_post_writer_id = None
+        if last_post_url:
+            last_post_writer_id = extract_writer_id_from_post_url(last_post_url)
+
         saved = (
             supabase.table("wave_states")
             .insert({
                 "run_id": active_run["id"],
                 "wave_number": int(wave_number),
                 "flow_text": flow_text,
-                "last_post_url": last_post_url
+                "last_post_url": last_post_url,
+                "last_post_writer_id": last_post_writer_id
             })
             .execute()
         )
@@ -328,11 +431,6 @@ def state_save():
 
 @app.route("/state/current", methods=["GET"])
 def state_current():
-    """
-    현재 active run 안의 병렬 웨이브 최신 상태 전체 조회
-    query:
-    ?waveName=[금토일웨이브]
-    """
     try:
         wave_name = request.args.get("waveName")
 
@@ -349,6 +447,38 @@ def state_current():
             "ok": True,
             "run": active_run,
             "states": states
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/state/board", methods=["GET"])
+def state_board():
+    try:
+        wave_name = request.args.get("waveName")
+
+        if not wave_name:
+            return jsonify({"error": "waveName is required"}), 400
+
+        active_run = get_active_run(wave_name)
+        if not active_run:
+            return jsonify({"error": "no active run"}), 404
+
+        result = (
+            supabase.table("wave_states")
+            .select("*")
+            .eq("run_id", active_run["id"])
+            .order("created_at", desc=False)
+            .execute()
+        )
+
+        states = result.data or []
+        summaries = build_board_summaries(states)
+
+        return jsonify({
+            "ok": True,
+            "run": active_run,
+            "summaries": summaries
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
