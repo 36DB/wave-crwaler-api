@@ -40,9 +40,6 @@ def now_iso():
 
 
 def normalize_url(url: str):
-    """
-    모바일 디시 링크를 PC 링크로 변환
-    """
     try:
         if "m.dcinside.com/board/" in url:
             m = re.search(r"/board/([^/]+)/(\d+)", url)
@@ -54,14 +51,6 @@ def normalize_url(url: str):
 
 
 def extract_wave(text):
-    """
-    웨이브 번호 추출
-    허용 예:
-    - 웨이브 2
-    - 2웨이브
-    - Wave 2
-    - 2 Wave
-    """
     patterns = [
         r"(?:웨이브|[Ww]ave)\s*(\d+)",
         r"(\d+)\s*(?:웨이브|[Ww]ave)"
@@ -74,9 +63,6 @@ def extract_wave(text):
 
 
 def extract_flow(text):
-    """
-    본문에서 흐름도 추출
-    """
     lines = [l.strip() for l in text.splitlines() if l.strip()]
 
     chain_lines = []
@@ -102,9 +88,6 @@ def extract_flow(text):
 
 
 def crawl_post(url):
-    """
-    글 크롤링
-    """
     url = normalize_url(url)
 
     r = session.get(url, timeout=10)
@@ -132,9 +115,6 @@ def crawl_post(url):
 # =============================
 
 def get_active_run(wave_name: str):
-    """
-    특정 웨이브 이름의 현재 active run 하나 가져오기
-    """
     result = (
         supabase.table("event_runs")
         .select("*")
@@ -151,9 +131,6 @@ def get_active_run(wave_name: str):
 
 
 def close_all_active_runs(wave_name: str):
-    """
-    같은 웨이브 이름의 active run 전부 종료
-    """
     result = (
         supabase.table("event_runs")
         .select("*")
@@ -175,6 +152,48 @@ def close_all_active_runs(wave_name: str):
             .eq("id", row["id"])
             .execute()
         )
+
+
+def get_latest_state_for_wave(run_id: int, wave_number: int):
+    result = (
+        supabase.table("wave_states")
+        .select("*")
+        .eq("run_id", run_id)
+        .eq("wave_number", wave_number)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+
+    if result.data and len(result.data) > 0:
+        return result.data[0]
+    return None
+
+
+def get_current_states_for_run(run_id: int):
+    """
+    병렬 웨이브용:
+    run 안의 모든 상태를 최신순으로 가져와서
+    wave_number별 최신 1개만 반환
+    """
+    result = (
+        supabase.table("wave_states")
+        .select("*")
+        .eq("run_id", run_id)
+        .order("created_at", desc=True)
+        .execute()
+    )
+
+    if not result.data:
+        return []
+
+    by_wave = {}
+    for row in result.data:
+        wave_number = row["wave_number"]
+        if wave_number not in by_wave:
+            by_wave[wave_number] = row
+
+    return sorted(by_wave.values(), key=lambda x: x["wave_number"])
 
 
 # =============================
@@ -203,8 +222,7 @@ def crawl():
 def run_start():
     """
     새 이벤트 시작
-    - 같은 wave_name의 기존 active run이 있으면 종료
-    - 새 active run 생성
+    같은 wave_name의 기존 active run이 있으면 종료 후 새로 시작
     """
     try:
         data = request.get_json(silent=True) or {}
@@ -274,7 +292,7 @@ def state_save():
     현재 상태 저장
     body:
     {
-      "waveName": "[기습웨이브]",
+      "waveName": "[금토일웨이브]",
       "waveNumber": 2,
       "flowText": "A -> B -> C ->",
       "lastPostUrl": "https://..."
@@ -322,9 +340,43 @@ def state_save():
 @app.route("/state/latest", methods=["GET"])
 def state_latest():
     """
-    현재 active run의 최신 상태 가져오기
+    현재 active run 안에서 특정 wave_number의 최신 상태 가져오기
     query:
-    ?waveName=[기습웨이브]
+    ?waveName=[금토일웨이브]&waveNumber=2
+    """
+    try:
+        wave_name = request.args.get("waveName")
+        wave_number = request.args.get("waveNumber")
+
+        if not wave_name:
+            return jsonify({"error": "waveName is required"}), 400
+
+        if not wave_number:
+            return jsonify({"error": "waveNumber is required"}), 400
+
+        active_run = get_active_run(wave_name)
+        if not active_run:
+            return jsonify({"error": "no active run"}), 404
+
+        latest = get_latest_state_for_wave(active_run["id"], int(wave_number))
+        if not latest:
+            return jsonify({"error": "no saved state for this wave"}), 404
+
+        return jsonify({
+            "ok": True,
+            "run": active_run,
+            "state": latest
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/state/current", methods=["GET"])
+def state_current():
+    """
+    현재 active run 안의 병렬 웨이브 최신 상태 전체 조회
+    query:
+    ?waveName=[금토일웨이브]
     """
     try:
         wave_name = request.args.get("waveName")
@@ -336,27 +388,16 @@ def state_latest():
         if not active_run:
             return jsonify({"error": "no active run"}), 404
 
-        latest = (
-            supabase.table("wave_states")
-            .select("*")
-            .eq("run_id", active_run["id"])
-            .order("created_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-
-        if not latest.data:
-            return jsonify({"error": "no saved state"}), 404
+        states = get_current_states_for_run(active_run["id"])
 
         return jsonify({
             "ok": True,
             "run": active_run,
-            "state": latest.data[0]
+            "states": states
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
-# 로컬 실행용
 if __name__ == "__main__":
     app.run()
