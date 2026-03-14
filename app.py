@@ -318,6 +318,8 @@ def build_board_summaries(states):
         if not valid_recs:
             continue
 
+        # 가장 긴 체인을 대표 체인으로 사용
+        # 길이가 같으면 최신 created_at 우선
         main_rec = max(
             valid_recs,
             key=lambda r: (len(r["participants_list"]), r.get("created_at", ""))
@@ -325,19 +327,38 @@ def build_board_summaries(states):
 
         final_chain = main_rec["participants_list"]
         final_canon = [canon_name(p) for p in final_chain]
-        final_pos = {c: i for i, c in enumerate(final_canon)}
 
-        post_info_by_canon = {}
+        # ✅ 이름 기준이 아니라 "체인 위치(index)" 기준으로 링크 매핑
+        # post_info_by_index[idx] = {"url": ..., "writer_id": ...}
+        post_by_index = {}
 
         for rec in valid_recs:
             plist = rec["participants_list"]
-            if len(plist) < 2:
+            if not plist:
                 continue
 
-            source_raw = plist[-2]
-            source_c = canon_name(source_raw)
+            rec_canon = [canon_name(p) for p in plist]
 
-            if source_c not in final_pos:
+            matched_idx = None
+
+            # 1순위: rec 체인이 final_chain의 prefix와 정확히 일치
+            if len(rec_canon) <= len(final_canon):
+                if final_canon[:len(rec_canon)] == rec_canon:
+                    matched_idx = len(rec_canon) - 1
+
+            # 2순위 fallback:
+            # 마지막 참가자 이름이 final_chain 어디에 있는지 찾되,
+            # 같은 이름이 여러 번 나오면 "길이상 맞는 마지막 위치"를 사용
+            if matched_idx is None:
+                last_c = rec_canon[-1]
+                candidate_indexes = [
+                    i for i, x in enumerate(final_canon) if x == last_c
+                ]
+                if candidate_indexes:
+                    # 가능한 후보 중 가장 뒤쪽 우선
+                    matched_idx = candidate_indexes[-1]
+
+            if matched_idx is None:
                 continue
 
             cand = {
@@ -347,17 +368,27 @@ def build_board_summaries(states):
                 "score_time": rec.get("created_at", "")
             }
 
-            prev = post_info_by_canon.get(source_c)
+            prev = post_by_index.get(matched_idx)
             if not prev:
-                post_info_by_canon[source_c] = cand
+                post_by_index[matched_idx] = cand
             else:
-                if (cand["score_len"], cand["score_time"]) > (prev["score_len"], prev["score_time"]):
-                    post_info_by_canon[source_c] = cand
+                if (cand["score_len"], cand["score_time"]) > (
+                    prev["score_len"], prev["score_time"]
+                ):
+                    post_by_index[matched_idx] = cand
+
+        post_info_by_index = {
+            idx: {
+                "url": v.get("url"),
+                "writer_id": v.get("writer_id")
+            }
+            for idx, v in post_by_index.items()
+        }
 
         summaries.append({
             "wave": wave_num,
             "final_chain": final_chain,
-            "post_info_by_canon": post_info_by_canon
+            "post_info_by_index": post_info_by_index
         })
 
     summaries.sort(key=lambda x: x["wave"])
