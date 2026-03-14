@@ -328,37 +328,38 @@ def build_board_summaries(states):
         final_chain = main_rec["participants_list"]
         final_canon = [canon_name(p) for p in final_chain]
 
-        # ✅ 이름 기준이 아니라 "체인 위치(index)" 기준으로 링크 매핑
-        # post_info_by_index[idx] = {"url": ..., "writer_id": ...}
+        # ✅ index 기준 매핑
+        # post_info_by_index[idx] = final_chain[idx] 사람의 글 링크
         post_by_index = {}
 
         for rec in valid_recs:
             plist = rec["participants_list"]
-            if not plist:
+            if len(plist) < 2:
                 continue
 
             rec_canon = [canon_name(p) for p in plist]
 
-            matched_idx = None
+            matched_source_idx = None
 
             # 1순위: rec 체인이 final_chain의 prefix와 정확히 일치
+            # ex) final = [A,B,C,D], rec = [A,B,C]
+            # rec.last_post_url 은 B의 글이므로 idx = len(rec)-2 = 1
             if len(rec_canon) <= len(final_canon):
                 if final_canon[:len(rec_canon)] == rec_canon:
-                    matched_idx = len(rec_canon) - 1
+                    matched_source_idx = len(rec_canon) - 2
 
             # 2순위 fallback:
-            # 마지막 참가자 이름이 final_chain 어디에 있는지 찾되,
-            # 같은 이름이 여러 번 나오면 "길이상 맞는 마지막 위치"를 사용
-            if matched_idx is None:
-                last_c = rec_canon[-1]
+            # rec의 "이전 사람"(plist[-2])이 final_chain에서 어디인지 찾되
+            # 같은 이름이 여러 번 나오면 가장 뒤쪽 일치를 우선
+            if matched_source_idx is None:
+                source_c = canon_name(plist[-2])
                 candidate_indexes = [
-                    i for i, x in enumerate(final_canon) if x == last_c
+                    i for i, x in enumerate(final_canon) if x == source_c
                 ]
                 if candidate_indexes:
-                    # 가능한 후보 중 가장 뒤쪽 우선
-                    matched_idx = candidate_indexes[-1]
+                    matched_source_idx = candidate_indexes[-1]
 
-            if matched_idx is None:
+            if matched_source_idx is None:
                 continue
 
             cand = {
@@ -368,14 +369,14 @@ def build_board_summaries(states):
                 "score_time": rec.get("created_at", "")
             }
 
-            prev = post_by_index.get(matched_idx)
+            prev = post_by_index.get(matched_source_idx)
             if not prev:
-                post_by_index[matched_idx] = cand
+                post_by_index[matched_source_idx] = cand
             else:
                 if (cand["score_len"], cand["score_time"]) > (
                     prev["score_len"], prev["score_time"]
                 ):
-                    post_by_index[matched_idx] = cand
+                    post_by_index[matched_source_idx] = cand
 
         post_info_by_index = {
             idx: {
