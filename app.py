@@ -1,5 +1,6 @@
 import os
 import re
+import time
 from datetime import datetime, timezone
 
 import requests
@@ -25,9 +26,16 @@ CORS(app)
 
 session = requests.Session()
 session.headers.update({
-    "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Referer": "https://gall.dcinside.com/"
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://gall.dcinside.com/",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
 })
 
 
@@ -56,6 +64,11 @@ def normalize_url(url: str):
     return url
 
 
+def add_cache_buster(url: str):
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}_ts={int(time.time() * 1000)}"
+
+
 def extract_wave(text):
     patterns = [
         r"(?:웨이브|[Ww]ave)\s*(\d+)",
@@ -82,17 +95,21 @@ def extract_flow(text):
             break
 
     if not chain_lines:
+        # fallback: 본문 전체에서 체인 패턴 재검색
+        compact = text.replace("\u00a0", " ")
+        compact = re.sub(r"\s*-\s*->\s*", " -> ", compact)
+        compact = re.sub(r"(?<!-)\s*>\s*", " -> ", compact)
+        compact = re.sub(r"\s*->\s*", " -> ", compact)
+        compact = re.sub(r"\s+", " ", compact).strip()
+
+        m = re.search(r"([^\\n]{0,400}?->.+?->.+?)(?:$)", compact)
+        if m:
+            return m.group(1).strip()
         return ""
 
     chain = " ".join(chain_lines)
-
-    # 이미 깨진 A - -> B 복원
     chain = re.sub(r"\s*-\s*->\s*", " -> ", chain)
-
-    # 단독 > 만 -> 로 변환
     chain = re.sub(r"(?<!-)\s*>\s*", " -> ", chain)
-
-    # 화살표 주변 공백 통일
     chain = re.sub(r"\s*->\s*", " -> ", chain)
     chain = re.sub(r"\s+", " ", chain)
 
@@ -127,12 +144,13 @@ def extract_writer_id_from_post_url(url: str):
 
     try:
         normalized = normalize_url(url)
-        r = session.get(normalized, timeout=10)
+        target_url = add_cache_buster(normalized)
+
+        r = session.get(target_url, timeout=10, allow_redirects=True)
         r.raise_for_status()
 
         soup = BeautifulSoup(r.text, "html.parser")
 
-        # 1) 게시글 페이지의 작성자 영역 찾기
         writer_el = (
             soup.select_one(".gall_writer")
             or soup.select_one("span.ub-writer")
@@ -140,7 +158,6 @@ def extract_writer_id_from_post_url(url: str):
             or soup.select_one("div.gall_writer")
         )
 
-        # 2) 작성자 영역 자체의 data-* 속성
         if writer_el:
             writer_id = (
                 (writer_el.get("data-uid") or "").strip()
@@ -150,7 +167,6 @@ def extract_writer_id_from_post_url(url: str):
             if writer_id:
                 return writer_id
 
-            # 3) 작성자 영역 내부 자식 요소의 data-* 속성
             child = (
                 writer_el.find(attrs={"data-uid": True})
                 or writer_el.find(attrs={"data-userid": True})
@@ -165,7 +181,6 @@ def extract_writer_id_from_post_url(url: str):
                 if writer_id:
                     return writer_id
 
-        # 4) gallog 링크 href에서 찾기
         gallog_link = soup.find("a", href=re.compile(r"gallog\.dcinside\.com"))
         if gallog_link:
             href = gallog_link.get("href", "")
@@ -173,7 +188,6 @@ def extract_writer_id_from_post_url(url: str):
             if m:
                 return m.group(1).strip()
 
-        # 5) onclick fallback
         gallog_link = soup.find("a", onclick=re.compile(r"gallog\.dcinside\.com"))
         if gallog_link:
             raw = gallog_link.get("onclick", "")
@@ -189,25 +203,39 @@ def extract_writer_id_from_post_url(url: str):
 
 
 def crawl_post(url):
-    url = normalize_url(url)
+    normalized = normalize_url(url)
+    target_url = add_cache_buster(normalized)
 
-    r = session.get(url, timeout=10)
+    r = session.get(target_url, timeout=10, allow_redirects=True)
     r.raise_for_status()
 
-    soup = BeautifulSoup(r.text, "html.parser")
+    html = r.text
+    soup = BeautifulSoup(html, "html.parser")
 
-    body = soup.select_one("div.write_div")
-    if not body:
-        body = soup
+    body = (
+        soup.select_one("div.write_div")
+        or soup.select_one("div.writing_view_box")
+        or soup.select_one("div.view_content_wrap")
+        or soup.select_one("div.gallview_contents")
+    )
 
-    text = body.get_text("\n", strip=True)
+    text = body.get_text("\n", strip=True) if body else soup.get_text("\n", strip=True)
 
     wave = extract_wave(text)
     flow = extract_flow(text)
 
     return {
         "waveNumber": wave,
-        "flowLine": flow
+        "flowLine": flow,
+        "debug": {
+            "requestedUrl": normalized,
+            "fetchedUrl": target_url,
+            "finalUrl": r.url,
+            "statusCode": r.status_code,
+            "title": soup.title.get_text(strip=True) if soup.title else "",
+            "bodySelectorFound": body is not None,
+            "preview": text[:1000],
+        }
     }
 
 
@@ -443,6 +471,9 @@ def state_save():
         last_post_writer_id = None
         if last_post_url:
             last_post_writer_id = extract_writer_id_from_post_url(last_post_url)
+
+        print("[DEBUG] last_post_url =", last_post_url)
+        print("[DEBUG] last_post_writer_id =", last_post_writer_id)
 
         saved = (
             supabase.table("wave_states")
