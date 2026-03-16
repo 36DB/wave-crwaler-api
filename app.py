@@ -88,27 +88,30 @@ def extract_flow(text):
     started = False
 
     for line in lines:
-        if "->" in line or ">" in line:
+        if "->" in line or ">" in line or "→" in line:
             chain_lines.append(line)
             started = True
         elif started:
             break
 
     if not chain_lines:
-        # fallback: 본문 전체에서 체인 패턴 재검색
         compact = text.replace("\u00a0", " ")
         compact = re.sub(r"\s*-\s*->\s*", " -> ", compact)
+        compact = re.sub(r"\s*-\s*>\s*", " -> ", compact)
+        compact = re.sub(r"\s*→\s*", " -> ", compact)
         compact = re.sub(r"(?<!-)\s*>\s*", " -> ", compact)
         compact = re.sub(r"\s*->\s*", " -> ", compact)
         compact = re.sub(r"\s+", " ", compact).strip()
 
-        m = re.search(r"([^\\n]{0,400}?->.+?->.+?)(?:$)", compact)
+        m = re.search(r"([^\n]{0,500}?->.+?->.+?)(?:$)", compact)
         if m:
             return m.group(1).strip()
         return ""
 
     chain = " ".join(chain_lines)
     chain = re.sub(r"\s*-\s*->\s*", " -> ", chain)
+    chain = re.sub(r"\s*-\s*>\s*", " -> ", chain)
+    chain = re.sub(r"\s*→\s*", " -> ", chain)
     chain = re.sub(r"(?<!-)\s*>\s*", " -> ", chain)
     chain = re.sub(r"\s*->\s*", " -> ", chain)
     chain = re.sub(r"\s+", " ", chain)
@@ -122,6 +125,8 @@ def parse_flow_text(flow_text: str):
 
     chain = flow_text.replace("\u00a0", " ")
     chain = re.sub(r"\s*-\s*->\s*", " -> ", chain)
+    chain = re.sub(r"\s*-\s*>\s*", " -> ", chain)
+    chain = re.sub(r"\s*→\s*", " -> ", chain)
     chain = re.sub(r"(?<!-)\s*>\s*", " -> ", chain)
     chain = re.sub(r"\s*->\s*", " -> ", chain)
 
@@ -259,6 +264,32 @@ def get_active_run(wave_name: str):
     return None
 
 
+def get_latest_run(wave_name: str):
+    result = (
+        supabase.table("event_runs")
+        .select("*")
+        .eq("wave_name", wave_name)
+        .order("started_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+
+    if result.data and len(result.data) > 0:
+        return result.data[0]
+    return None
+
+
+def get_preferred_run(wave_name: str):
+    """
+    1순위: active run
+    2순위: 같은 wave_name의 가장 최신 run (closed 포함)
+    """
+    active_run = get_active_run(wave_name)
+    if active_run:
+        return active_run
+    return get_latest_run(wave_name)
+
+
 def close_all_active_runs(wave_name: str):
     result = (
         supabase.table("event_runs")
@@ -318,8 +349,6 @@ def build_board_summaries(states):
         if not valid_recs:
             continue
 
-        # 가장 긴 체인을 대표 체인으로 사용
-        # 길이가 같으면 최신 created_at 우선
         main_rec = max(
             valid_recs,
             key=lambda r: (len(r["participants_list"]), r.get("created_at", ""))
@@ -328,8 +357,7 @@ def build_board_summaries(states):
         final_chain = main_rec["participants_list"]
         final_canon = [canon_name(p) for p in final_chain]
 
-        # ✅ index 기준 매핑
-        # post_info_by_index[idx] = final_chain[idx] 사람의 글 링크
+        # post_info_by_index[idx] = final_chain[idx] 사람의 모집글/갤로그 정보
         post_by_index = {}
 
         for rec in valid_recs:
@@ -338,19 +366,14 @@ def build_board_summaries(states):
                 continue
 
             rec_canon = [canon_name(p) for p in plist]
-
             matched_source_idx = None
 
-            # 1순위: rec 체인이 final_chain의 prefix와 정확히 일치
-            # ex) final = [A,B,C,D], rec = [A,B,C]
-            # rec.last_post_url 은 B의 글이므로 idx = len(rec)-2 = 1
+            # rec = [A, B, C] 라면 last_post_url 은 B의 글
+            # 따라서 idx = len(rec) - 2 에 붙어야 맞음
             if len(rec_canon) <= len(final_canon):
                 if final_canon[:len(rec_canon)] == rec_canon:
                     matched_source_idx = len(rec_canon) - 2
 
-            # 2순위 fallback:
-            # rec의 "이전 사람"(plist[-2])이 final_chain에서 어디인지 찾되
-            # 같은 이름이 여러 번 나오면 가장 뒤쪽 일치를 우선
             if matched_source_idx is None:
                 source_c = canon_name(plist[-2])
                 candidate_indexes = [
@@ -536,15 +559,15 @@ def state_current():
         if not wave_name:
             return jsonify({"error": "waveName is required"}), 400
 
-        active_run = get_active_run(wave_name)
-        if not active_run:
-            return jsonify({"error": "no active run"}), 404
+        run = get_preferred_run(wave_name)
+        if not run:
+            return jsonify({"error": "no matching run"}), 404
 
-        states = get_current_states_for_run(active_run["id"])
+        states = get_current_states_for_run(run["id"])
 
         return jsonify({
             "ok": True,
-            "run": active_run,
+            "run": run,
             "states": states
         })
     except Exception as e:
@@ -559,14 +582,14 @@ def state_board():
         if not wave_name:
             return jsonify({"error": "waveName is required"}), 400
 
-        active_run = get_active_run(wave_name)
-        if not active_run:
-            return jsonify({"error": "no active run"}), 404
+        run = get_preferred_run(wave_name)
+        if not run:
+            return jsonify({"error": "no matching run"}), 404
 
         result = (
             supabase.table("wave_states")
             .select("*")
-            .eq("run_id", active_run["id"])
+            .eq("run_id", run["id"])
             .order("created_at", desc=False)
             .execute()
         )
@@ -576,7 +599,7 @@ def state_board():
 
         return jsonify({
             "ok": True,
-            "run": active_run,
+            "run": run,
             "summaries": summaries
         })
     except Exception as e:
